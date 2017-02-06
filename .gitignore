@@ -95,4 +95,4 @@ database/
 model/
 corpus/
 cache/
-
+log/

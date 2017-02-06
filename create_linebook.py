@@ -2,6 +2,12 @@
 
 import argparse
 
+from log_tool import generate_logger
+
+logger = generate_logger(__file__)
+
+from progressbar import ProgressBar, Percentage, Bar, ETA
+
 
 def getArgs():
     parser = argparse.ArgumentParser(description="")
@@ -46,9 +52,17 @@ def create_linebooks(input_file):
 if __name__ == "__main__":
     args = getArgs()
 
+    logger.debug('Create linebook by letterbook')
     linebooks = create_linebooks(args.input_file)
+
+    logger.debug('Create linebook by letterbook')
+    progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
+                                maxval=len(linebooks)).start()
+    i = 1
 
     for linebook in linebooks:
         for token in linebook:
             args.output_file.write(token + " ")
         args.output_file.write("\n")
+        progress.update(i)
+        i = i + 1

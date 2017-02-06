@@ -1,12 +1,8 @@
 # _*_coding:utf-8_*_
 
-from logging import getLogger, StreamHandler, DEBUG
+from log_tool import generate_logger
 
-logger = getLogger(__name__)
-handler = StreamHandler()
-handler.setLevel(DEBUG)
-logger.setLevel(DEBUG)
-logger.addHandler(handler)
+logger = generate_logger(__file__)
 
 from word2id import Word2Id
 
@@ -105,8 +101,8 @@ class Seq2Seq(Chain):
         self.connecter.reset_state()
         self.decoder.reset_state()
 
-    def generate(self, w2i, start_token_id, end_token_id, limit=30):
-        context = self.encode([start_token_id], train=False)
+    def generate(self, w2i, input_token_list, end_token_id, limit=30):
+        context = self.encode(input_token_list, train=False)
         token_list = []
 
         for _ in range(limit):
@@ -136,8 +132,6 @@ def dump_cache(w2i_dict, correct_id_lists, wrong_id_lists):
 
 
 if __name__ == "__main__":
-    logger.debug('Start seq2seq script')
-
     args = getArgs()
 
     # if args.cache_flag:
@@ -234,9 +228,8 @@ if __name__ == "__main__":
         correct_token_list = w2i.generate_token_list_by(correct_id_list)
         wrong_token_list = w2i.generate_token_list_by(wrong_id_list)
 
-        start_token_id = w2i["BOL"]
         end_token_id = w2i["NEWLINE"]
-        predicted_token_list = model.generate(w2i, start_token_id, end_token_id)
+        predicted_token_list = model.generate(w2i, wrong_id_list, end_token_id)
 
         logger.debug('=======================================================')
         logger.debug('INPUT (wrong tokens)')

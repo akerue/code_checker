@@ -3,6 +3,9 @@
 import collections
 import pprint
 
+from log_tool import generate_logger
+
+logger = generate_logger(__file__)
 
 class Word2Id:
     def __init__(self):
@@ -24,6 +27,7 @@ class Word2Id:
         try:
             return word2id_dict.keys()[word2id_dict.values().index(word_id)]
         except ValueError:
+            logger.debug('Word which has {} as id not found'.format(word_id))
             return None
 
     def generate_id_list_by(self, tokens):

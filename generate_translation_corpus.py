@@ -6,6 +6,11 @@ import argparse
 import random
 random.seed()
 
+from log_tool import generate_logger
+
+logger = generate_logger(__file__)
+
+from progressbar import ProgressBar, Percentage, Bar, ETA
 
 def getArgs():
     parser = argparse.ArgumentParser(description="")
@@ -69,11 +74,24 @@ if __name__ == "__main__":
 
     corpus = []
 
+    logger.debug('Generate error token randomly')
+
+    progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
+                                maxval=len(tokens_list)).start()
+    i = 1
     for tokens in tokens_list:
         error_tokens_list = generate_error_tokens(tokens)
         corpus.append((tokens, error_tokens_list))
+        progress.update(i)
+        i = i + 1
 
+    logger.debug('Export error and correct corpus')
+    progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
+                                maxval=len(corpus)).start()
+    i = 1
     for correct_token, wrong_tokens in corpus:
         for wrong_token in wrong_tokens:
             args.correct_file.write(" ".join(correct_token))
             args.wrong_file.write(" ".join(wrong_token))
+        progress.update(i)
+        i = i + 1
