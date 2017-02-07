@@ -102,8 +102,8 @@ class Seq2Seq(Chain):
         self.connecter.reset_state()
         self.decoder.reset_state()
 
-    def generate(self, w2i, input_token_list, end_token_id, limit=30):
-        context = self.encode(input_token_list, train=False)
+    def generate(self, w2i, input_id_list, end_token_id, limit=30):
+        context = self.encode(input_id_list, train=False)
         token_list = []
 
         for _ in range(limit):
@@ -114,18 +114,18 @@ class Seq2Seq(Chain):
                 break
         return token_list
 
-    def evaluate(self, input_token_list, end_token_id, test_data):
+    def evaluate(self, input_id_list, end_token_id, test_id_list):
         # 評価方法よくわからんかったのでとりあえず自前で書いてみる
-        context = self.encode(input_token_list, train=False)
+        context = self.encode(input_id_list, train=False)
 
-        n = 1
+        N = len(test_id_list)
         loss = 0.0
         accuracy = 0.0
 
-        for _ in len(test_data):
-            context = self.decode(context, test_data=None, train=False)
+        for test_id in test_id_list:
+            context = self.decode(context, teacher_data=None, train=False)
 
-            t = np.array([test_data], dtype=np.int32)
+            t = np.array([test_id], dtype=np.int32)
             t = Variable(t)
             loss += F.softmax_cross_entropy(context, t)
             accuracy += F.accuracy(context, t)
@@ -133,9 +133,7 @@ class Seq2Seq(Chain):
             if np.argmax(context.data) == end_token_id:
                 break
 
-            n = n + 1
-
-        return loss/n, accuracy/n
+        return loss/N, accuracy/N
 
 
 # TODO
@@ -196,9 +194,6 @@ def main(args):
     # logger.debug('Generate cache of dataset')
     # dump_cache(w2i, correct_id_lists, wrong_id_lists)
 
-    logger.debug('\nThis is word2id dict')
-    w2i.show_dict()
-
     logger.debug('Build Sequence to sequence newral network')
     model = Seq2Seq()
     optimizer = optimizers.SGD()
@@ -220,14 +215,16 @@ def main(args):
     logger.debug('\n >>> Total vocab size: {}'.format(w2i.vocab_size()))
 
     logger.debug('===================================================')
-    for epoch in range(EPOCH):
+    for epoch in range(1, EPOCH+1):
 
         logger.debug('Start learning phase of {} epoch'.format(epoch))
         learning_progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
                                         maxval=len(zip(train_correct_lists, train_wrong_lists))).start()
         i = 1
 
-        for correct_id_list, wrong_id_list in np.random.permutation(zip(train_correct_lists, train_wrong_lists)):
+        for correct_id_list, wrong_id_list in np.random.permutation(
+                            zip(train_correct_lists, train_wrong_lists)):
+
             model.initialize()
 
             context = model.encode(wrong_id_list, train=True)
@@ -258,9 +255,10 @@ def main(args):
 
         end_token_id = w2i["NEWLINE"]
 
-        for correct_id_list, wrong_id_list in np.random.permutation(zip(test_correct_lists, test_wrong_lists)):
-            correct_token_list = w2i.generate_token_list_by(correct_id_list)
-            wrong_token_list = w2i.generate_token_list_by(wrong_id_list)
+        for correct_id_list, wrong_id_list in np.random.permutation(
+                        zip(test_correct_lists, test_wrong_lists)):
+            # correct_token_list = w2i.generate_token_list_by(correct_id_list)
+            # wrong_token_list = w2i.generate_token_list_by(wrong_id_list)
 
             # predicted_token_list = model.generate(w2i, wrong_id_list, end_token_id)
 
@@ -271,7 +269,7 @@ def main(args):
             # logger.debug('EXPECTED (correct tokens)')
             # logger.debug(" ".join(correct_token_list))
 
-            loss, accuracy = model.evaluate(wrong_token_list, end_token_id, correct_token_list)
+            loss, accuracy = model.evaluate(wrong_id_list, end_token_id, correct_id_list)
 
             loss += loss
             accuracy += accuracy
@@ -279,7 +277,10 @@ def main(args):
             evaluate_progress.update(n+1)
             n = n + 1
 
-        logger.debug("accuracy: {}, loss: {}".format(accuracy/n, loss/n))
+        accuracy = accuracy/N
+        loss = loss/N
+
+        logger.debug("accuracy: {}, loss: {}".format(accuracy.data, loss.data))
 
     logger.debug('Save result of learning')
     serializers.save_hdf5(MODEL_PATH, model)
