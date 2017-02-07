@@ -96,3 +96,4 @@ model/
 corpus/
 cache/
 log/
+serialize/
