@@ -18,6 +18,8 @@ import os.path
 import math
 import cPickle as pickle
 
+from tqdm import tqdm
+
 from progressbar import ProgressBar, Percentage, Bar, ETA
 
 VOCAB_SIZE = 100
@@ -232,8 +234,8 @@ def main(args):
     for epoch in range(1, EPOCH+1):
 
         logger.debug('Start learning phase of {} epoch'.format(epoch))
-        learning_progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
-                                        maxval=len(zip(train_correct_lists, train_wrong_lists))).start()
+        learning_progress = tqdm(total=len(train_correct_lists))
+
         i = 1
 
         for correct_id_list, wrong_id_list in np.random.permutation(
@@ -264,13 +266,14 @@ def main(args):
             perp = math.exp(loss_data)
             acc_data = float(cuda.to_cpu(sum_accuracy.data))/N
 
-            logger.info("[training] epoch={} iter={} perplexity={} accuracy={}".format(
+            learning_progress.set_description("[training] epoch={} iter={} perplexity={} accuracy={}".format(
                             epoch, i, perp, acc_data
                         ))
 
-            learning_progress.update(i)
+            learning_progress.update(1)
             i = i + 1
 
+        learning_progress.close()
         logger.debug('Start evaluation phase of {} epoch'.format(epoch))
 
         N = len(zip(test_correct_lists, test_wrong_lists))
