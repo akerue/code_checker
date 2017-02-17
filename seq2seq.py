@@ -6,6 +6,7 @@ logger = generate_logger(__file__)
 
 from word2id import Word2Id
 
+import chainer
 from chainer import optimizers, serializers, cuda
 from chainer import Chain, Variable
 import chainer.functions as F
@@ -19,6 +20,8 @@ import math
 import cPickle as pickle
 
 from progressbar import ProgressBar, Percentage, Bar, ETA
+
+xp = np
 
 VOCAB_SIZE = 100
 HIDDEN_SIZE = 50
@@ -85,7 +88,7 @@ class Seq2Seq(Chain):
 
     def encode(self, token_list, train):
         for token in token_list:
-            token = Variable(np.array([[token]], dtype=np.int32))
+            token = Variable(xp.array([[token]], dtype=xp.int32))
             embed_vec = F.tanh(self.embed(token))  # Enbed層で埋め込み後, tanh関数で活性化
             input_feature = self.encoder(embed_vec)
             context = self.connecter(F.dropout(input_feature,
@@ -98,7 +101,7 @@ class Seq2Seq(Chain):
         predict_data = self.output(output_feature)
 
         if train:
-            t = np.array([teacher_data], dtype=np.int32)
+            t = xp.array([teacher_data], dtype=xp.int32)
             t = Variable(t)
             loss = F.softmax_cross_entropy(predict_data, t)
             accuracy = F.accuracy(predict_data, t)
@@ -108,7 +111,6 @@ class Seq2Seq(Chain):
 
     def initialize(self):
         self.encoder.reset_state()
-        self.connecter.reset_state()
         self.decoder.reset_state()
 
     def generate(self, w2i, input_id_list, end_token_id, limit=30):
@@ -117,7 +119,7 @@ class Seq2Seq(Chain):
 
         for _ in range(limit):
             context = self.decode(context, teacher_data=None, train=False)
-            token = w2i.search_word_by(np.argmax(context.data))
+            token = w2i.search_word_by(xp.argmax(context.data))
             token_list.append(token)
             if token == w2i.search_word_by(end_token_id):
                 break
@@ -134,12 +136,12 @@ class Seq2Seq(Chain):
         for test_id in test_id_list:
             context = self.decode(context, teacher_data=None, train=False)
 
-            t = np.array([test_id], dtype=np.int32)
+            t = xp.array([test_id], dtype=xp.int32)
             t = Variable(t)
             loss += F.softmax_cross_entropy(context, t)
             accuracy += F.accuracy(context, t)
 
-            if np.argmax(context.data) == end_token_id:
+            if xp.argmax(context.data) == end_token_id:
                 break
 
         return loss, accuracy, N
@@ -163,6 +165,7 @@ def dump_cache(w2i_dict, correct_id_lists, wrong_id_lists):
 
 
 def main(args):
+    global xp
     # if args.cache_flag:
     #     cache_data = check_and_load_cache()
     # else:
@@ -185,7 +188,7 @@ def main(args):
                                 maxval=len(correct_tokens_list)).start()
     i = 1
     for tokens in correct_tokens_list:
-        correct_id_lists.append(np.array(w2i.generate_id_list_by(tokens), dtype=np.int32))
+        correct_id_lists.append(xp.array(w2i.generate_id_list_by(tokens), dtype=xp.int32))
         dict_progress.update(i)
         i = i + 1
 
@@ -196,7 +199,7 @@ def main(args):
                                 maxval=len(wrong_tokens_list)).start()
     i = 1
     for tokens in wrong_tokens_list:
-        wrong_id_lists.append(np.array(w2i.generate_id_list_by(tokens), dtype=np.int32))
+        wrong_id_lists.append(xp.array(w2i.generate_id_list_by(tokens), dtype=xp.int32))
         dict_progress.update(i)
         i = i + 1
 
@@ -209,6 +212,8 @@ def main(args):
     if args.gpu >= 0:
         cuda.get_device(args.gpu).use()
         model.to_gpu(args.gpu)
+	import cupy
+	xp = cupy
 
     optimizer = optimizers.SGD()
     optimizer.setup(model)
@@ -232,12 +237,15 @@ def main(args):
     for epoch in range(1, EPOCH+1):
 
         logger.debug('Start learning phase of {} epoch'.format(epoch))
-        learning_progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
-                                        maxval=len(zip(train_correct_lists, train_wrong_lists))).start()
         i = 1
 
-        for correct_id_list, wrong_id_list in np.random.permutation(
-                            zip(train_correct_lists, train_wrong_lists)):
+        train_dataset = zip(train_correct_lists, train_wrong_lists)
+
+	max_iter = len(train_dataset)/16
+        learning_progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
+                                        maxval=max_iter).start()
+
+        for [(correct_id_list, wrong_id_list)] in chainer.iterators.SerialIterator(train_dataset, 1, False, True):
 
             model.initialize()
 
@@ -264,12 +272,15 @@ def main(args):
             perp = math.exp(loss_data)
             acc_data = float(cuda.to_cpu(sum_accuracy.data))/N
 
-            logger.info("[training] epoch={} iter={} perplexity={} accuracy={}".format(
-                            epoch, i, perp, acc_data
-                        ))
+            # logger.info("[training] epoch={} iter={} perplexity={} accuracy={}".format(
+            #                 epoch, i, perp, acc_data
+            #             ))
 
             learning_progress.update(i)
             i = i + 1
+
+	    if max_iter == i:
+		break
 
         logger.debug('Start evaluation phase of {} epoch'.format(epoch))
 
@@ -283,8 +294,9 @@ def main(args):
 
         end_token_id = w2i["NEWLINE"]
 
-        for correct_id_list, wrong_id_list in np.random.permutation(
-                        zip(test_correct_lists, test_wrong_lists)):
+        test_dataset = zip(test_correct_lists, test_wrong_lists)
+
+        for [(correct_id_list, wrong_id_list)] in chainer.iterators.SerialIterator(test_dataset, 1, False, True):
             # correct_token_list = w2i.generate_token_list_by(correct_id_list)
             # wrong_token_list = w2i.generate_token_list_by(wrong_id_list)
 
