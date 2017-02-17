@@ -6,7 +6,7 @@ logger = generate_logger(__file__)
 
 from word2id import Word2Id
 
-from chainer import optimizers, serializers
+from chainer import optimizers, serializers, cuda
 from chainer import Chain, Variable
 import chainer.functions as F
 import chainer.links as L
@@ -15,7 +15,7 @@ import numpy as np
 import argparse
 from decimal import *
 import os.path
-import dill
+import math
 import cPickle as pickle
 
 from progressbar import ProgressBar, Percentage, Bar, ETA
@@ -61,6 +61,13 @@ def getArgs():
         default=True,
     )
 
+    parser.add_argument(
+        "--gpu",
+        dest="gpu",
+        type=int,
+        default=0,
+    )
+
     return parser.parse_args()
 
 
@@ -70,7 +77,7 @@ class Seq2Seq(Chain):
             embed=L.EmbedID(VOCAB_SIZE, FEATURE_SIZE),
             encoder=L.LSTM(FEATURE_SIZE, HIDDEN_SIZE),
 
-            connecter=L.LSTM(HIDDEN_SIZE, VOCAB_SIZE),
+            connecter=L.Linear(HIDDEN_SIZE, VOCAB_SIZE),
 
             decoder=L.LSTM(VOCAB_SIZE, VOCAB_SIZE),
             output=L.Linear(VOCAB_SIZE, VOCAB_SIZE),
@@ -93,7 +100,9 @@ class Seq2Seq(Chain):
         if train:
             t = np.array([teacher_data], dtype=np.int32)
             t = Variable(t)
-            return F.softmax_cross_entropy(predict_data, t), predict_data
+            loss = F.softmax_cross_entropy(predict_data, t)
+            accuracy = F.accuracy(predict_data, t)
+            return loss, accuracy, predict_data
         else:
             return predict_data
 
@@ -133,7 +142,7 @@ class Seq2Seq(Chain):
             if np.argmax(context.data) == end_token_id:
                 break
 
-        return loss/N, accuracy/N
+        return loss, accuracy, N
 
 
 # TODO
@@ -196,6 +205,11 @@ def main(args):
 
     logger.debug('Build Sequence to sequence newral network')
     model = Seq2Seq()
+
+    if args.gpu >= 0:
+        cuda.get_device(args.gpu).use()
+        model.to_gpu(args.gpu)
+
     optimizer = optimizers.SGD()
     optimizer.setup(model)
 
@@ -229,17 +243,30 @@ def main(args):
 
             context = model.encode(wrong_id_list, train=True)
 
-            acc_loss = 0
+            sum_loss = 0
+            sum_accuracy = 0
+            N = len(correct_id_list)
 
-            # バッチ学習の場合には行を複数にしてacc_lossを計算した後にパラメータを更新する
+            # バッチ学習の場合には行を複数にしてsum_lossを計算した後にパラメータを更新する
             for correct_id in correct_id_list:
-                loss, context = model.decode(context, correct_id, train=True)
-                acc_loss += loss
+                loss, accuracy, context = model.decode(context, correct_id, train=True)
+                sum_loss += loss
+                sum_accuracy += accuracy
 
             model.cleargrads()  # 前の学習結果のgradが残っているので初期化する
-            acc_loss.backward()  # model内でgradを計算, 設定
-            acc_loss.unchain_backward()  # これ必要なの？
+            sum_loss.backward()  # model内でgradを計算, 設定
+            sum_loss.unchain_backward()  # これ必要なの？
+            sum_accuracy.backward()  # model内でgradを計算, 設定
+            sum_accuracy.unchain_backward()  # これ必要なの？
             optimizer.update()  # 上で計算したgradを元にSGDを実行
+
+            loss_data = float(cuda.to_cpu(sum_loss.data))/N
+            perp = math.exp(loss_data)
+            acc_data = float(cuda.to_cpu(sum_accuracy.data))/N
+
+            logger.info("[training] epoch={} iter={} perplexity={} accuracy={}".format(
+                            epoch, i, perp, acc_data
+                        ))
 
             learning_progress.update(i)
             i = i + 1
@@ -249,9 +276,10 @@ def main(args):
         N = len(zip(test_correct_lists, test_wrong_lists))
         evaluate_progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
                                         maxval=N).start()
-        n = 0
+        j = 0
         loss = 0.0
         accuracy = 0.0
+        num_of_trials = 0
 
         end_token_id = w2i["NEWLINE"]
 
@@ -269,16 +297,17 @@ def main(args):
             # logger.debug('EXPECTED (correct tokens)')
             # logger.debug(" ".join(correct_token_list))
 
-            loss, accuracy = model.evaluate(wrong_id_list, end_token_id, correct_id_list)
+            loss, accuracy, n = model.evaluate(wrong_id_list, end_token_id, correct_id_list)
 
             loss += loss
             accuracy += accuracy
+            num_of_trials += n
 
-            evaluate_progress.update(n+1)
-            n = n + 1
+            evaluate_progress.update(j+1)
+            j = j + 1
 
-        accuracy = accuracy/N
-        loss = loss/N
+        accuracy = float(cuda.to_cpu(accuracy))/num_of_trials
+        loss = float(cuda.to_cpu(loss))/num_of_trials
 
         logger.debug("accuracy: {}, loss: {}".format(accuracy.data, loss.data))
 
