@@ -13,10 +13,12 @@ import chainer.functions as F
 import chainer.links as L
 
 import numpy as np
+from numpy import * 
 import argparse
 from decimal import *
 import os.path
 import math
+import dill
 import cPickle as pickle
 
 from tqdm import tqdm
@@ -25,17 +27,20 @@ from progressbar import ProgressBar, Percentage, Bar, ETA
 
 xp = np
 
-VOCAB_SIZE = 100
 HIDDEN_SIZE = 50
 FEATURE_SIZE = 50
-EPOCH = 10
+#EPOCH = 10
 DROPOUT_RATIO = 0.5
+BATCH_SIZE = 256
 
 CACHE_PATH = "./cache/word2id_dict.pkl"
-MODEL_PATH = "./serialize/seq2seq.model"
-OPT_PATH = "./serialize/seq2seq.opt"
+MODEL_PATH = "./serialize/seq2seq_epoch{}.model"
+OPT_PATH = "./serialize/seq2seq_epoch{}.opt"
 
 getcontext().prec = 7
+
+START_TOKEN = "BOL"
+END_TOKEN = "NEWLINE"
 
 
 def getArgs():
@@ -77,76 +82,108 @@ def getArgs():
 
 
 class Seq2Seq(Chain):
-    def __init__(self):
+    def __init__(self, vocab_size):
+        feature_size = vocab_size/50
+        hidden_size = vocab_size/50
         super(Seq2Seq, self).__init__(
-            embed=L.EmbedID(VOCAB_SIZE, FEATURE_SIZE),
-            encoder=L.LSTM(FEATURE_SIZE, HIDDEN_SIZE),
+            embed=L.EmbedID(vocab_size, feature_size),
+            encoder=L.LSTM(feature_size, hidden_size),
 
-            connecter=L.Linear(HIDDEN_SIZE, VOCAB_SIZE),
+            connecter=L.Linear(hidden_size, hidden_size),
 
-            decoder=L.LSTM(VOCAB_SIZE, VOCAB_SIZE),
-            output=L.Linear(VOCAB_SIZE, VOCAB_SIZE),
+            decoder=L.LSTM(feature_size, hidden_size),
+            output=L.Linear(hidden_size, vocab_size),
         )
 
-    def encode(self, token_list, train):
-        for token in token_list:
-            token = Variable(xp.array([[token]], dtype=xp.int32))
-            embed_vec = F.tanh(self.embed(token))  # Enbed層で埋め込み後, tanh関数で活性化
-            input_feature = self.encoder(embed_vec)
-            context = self.connecter(F.dropout(input_feature,
-                                     ratio=DROPOUT_RATIO, train=train))
+    def encode(self, token_list_batch):
+        for tokens in token_list_batch:
+            # tokens = Variable(xp.array([[tokens]], dtype=xp.int32))
+            embed_vec = F.tanh(self.embed(tokens))  # Enbed層で埋め込み後, tanh関数で活性化
+            state = self.encoder(embed_vec)
 
-        return context
+        return state
 
-    def decode(self, context, teacher_data, train):
-        output_feature = self.decoder(context)
-        predict_data = self.output(output_feature)
+    def decode(self, input_data, teacher_data):
+        embed_vec = F.tanh(self.embed(input_data))  # Enbed層で埋め込み後, tanh関数で活性化
+        state = self.decoder(embed_vec)
+        predict_data = self.output(state)
 
-        if train:
-            t = xp.array([teacher_data], dtype=xp.int32)
-            t = Variable(t)
-            loss = F.softmax_cross_entropy(predict_data, t)
-            accuracy = F.accuracy(predict_data, t)
-            return loss, accuracy, predict_data
+        # 実際にトークンを予測生成する場合には教師データはいらない
+        if teacher_data is not None:
+            loss = F.softmax_cross_entropy(predict_data, teacher_data)
+            accuracy = F.accuracy(predict_data, teacher_data, ignore_label=-1)
         else:
-            return predict_data
+            loss = None
+            accuracy = None
+
+        return loss, accuracy, predict_data
 
     def initialize(self):
         self.encoder.reset_state()
         self.decoder.reset_state()
 
-    def generate(self, w2i, input_id_list, end_token_id, limit=30):
-        context = self.encode(input_id_list, train=False)
+    def generate(self, w2i, input_id_list, limit=30):
+        # generateではバッチ処理は行う必要はないが、バッチとして
+        # encode, decodeに入力して処理を共通化
+        # バッチサイズ1のバッチとして生成
+
+        self.initialize()
+
+        xs = make_batch(input_id_list, train=False)
+        
+        state = self.encode(xs)
+        context = self.connecter(F.dropout(state,
+                                 ratio=DROPOUT_RATIO, train=False))
+        self.decoder.h = context
+
         token_list = []
 
+        # 入力の最初は"BOL"
+        input_data = Variable(xp.array([w2i[START_TOKEN]], dtype=xp.int32), volatile=True)
+
         for _ in range(limit):
-            context = self.decode(context, teacher_data=None, train=False)
-            token = w2i.search_word_by(xp.argmax(context.data))
+            _, _, predict_data = self.decode(input_data, teacher_data=None)
+
+            token = w2i.search_word_by(xp.argmax(predict_data.data))
             token_list.append(token)
-            if token == w2i.search_word_by(end_token_id):
+            if token == w2i.search_word_by(w2i[END_TOKEN]):
                 break
+
+            # 生成では予測された次の単語を入力データにする
+            input_list = xp.argmax(predict_data.data, axis=1).astype(np.int32)
+            input_data = Variable(input_list, volatile=True)
+            
         return token_list
 
-    def evaluate(self, input_id_list, end_token_id, test_id_list):
-        # 評価方法よくわからんかったのでとりあえず自前で書いてみる
-        context = self.encode(input_id_list, train=False)
+    def evaluate(self, w2i, input_id_list, test_id_list):
+        self.initialize()
+
+        state = self.encode(input_id_list)
+
+        context = self.connecter(F.dropout(state,
+                                 ratio=DROPOUT_RATIO, train=False))
+        self.decoder.h = context
 
         N = len(test_id_list)
-        loss = 0.0
-        accuracy = 0.0
+        sum_loss = 0.0
+        sum_accuracy = 0.0
+
+        # 入力の最初は"BOL"
+        input_data = xp.ones(BATCH_SIZE, dtype=xp.int32)
+        input_data = input_data * xp.array([w2i[START_TOKEN]], dtype=xp.int32)
+        input_data = Variable(input_data)
 
         for test_id in test_id_list:
-            context = self.decode(context, teacher_data=None, train=False)
+            loss, accuracy, predict_data = self.decode(input_data, test_id)
 
-            t = xp.array([test_id], dtype=xp.int32)
-            t = Variable(t)
-            loss += F.softmax_cross_entropy(context, t)
-            accuracy += F.accuracy(context, t)
+            sum_loss += loss
+            sum_accuracy += accuracy
 
-            if xp.argmax(context.data) == end_token_id:
-                break
+            # 評価では予測された次の単語を入力データにする
+            input_list = xp.argmax(predict_data.data, axis=1).astype(np.int32)
+            input_data = Variable(input_list)
 
-        return loss, accuracy, N
+        return sum_loss/N, sum_accuracy/N
 
 
 # TODO
@@ -164,6 +201,43 @@ def check_and_load_cache():
 def dump_cache(w2i_dict, correct_id_lists, wrong_id_lists):
     with open(CACHE_PATH, "wb") as f:
         pickle.dump([w2i_dict, correct_id_lists, wrong_id_lists], f)
+
+
+def make_batch(x, train, tail=True, xp=cuda.cupy):
+    # 最長のトークン列の長さを計測
+    if not isinstance(x[0], (int, xp.integer)):
+        N = len(x)
+        max_length = -1
+
+        for i in xrange(N):
+            l = len(x[i])
+            if l > max_length:
+                max_length = l
+    else:
+        N = 1
+        max_length = len(x)
+
+    y = np.zeros((N, max_length), dtype=np.int32)
+
+    # tailがTrueなら逆向きにパッディングしている
+    if N > 1:
+        # バッチサイズ1のときには必要ない
+        if tail:
+            for i in xrange(N):
+                l = len(x[i])
+                y[i, 0:max_length-l] = -1
+                y[i, max_length-l:] = x[i]
+        else:
+            for i in xrange(N):
+                l = len(x[i])
+                y[i, 0:l] = x[i]
+                y[i, l:] = -1
+
+    # バッチとして使えるように転地している
+    y = [Variable(xp.asarray(y[:,j]), volatile=not train)
+            for j in xrange(y.shape[1])]
+
+    return y
 
 
 def main(args):
@@ -208,8 +282,12 @@ def main(args):
     # logger.debug('Generate cache of dataset')
     # dump_cache(w2i, correct_id_lists, wrong_id_lists)
 
+    with open(CACHE_PATH, "wb") as f:
+        dill.dump(w2i, f)
+
     logger.debug('Build Sequence to sequence newral network')
-    model = Seq2Seq()
+    logger.debug(w2i.vocab_size())
+    model = Seq2Seq(w2i.vocab_size())
 
     if args.gpu >= 0:
         cuda.get_device(args.gpu).use()
@@ -223,6 +301,8 @@ def main(args):
     num_of_sample = len(correct_id_lists)
 
     # 学習サンプルと評価サンプルに分割
+    # 学習サンプルが全サンプルの9/10
+    # 評価サンプルが全サンプルの1/10
     logger.debug('Generate train and test dataset')
     train_correct_lists = correct_id_lists[:num_of_sample*9/10]
     test_correct_lists = correct_id_lists[num_of_sample*9/10+1:]
@@ -235,46 +315,58 @@ def main(args):
 
     logger.debug('\n >>> Total vocab size: {}'.format(w2i.vocab_size()))
 
-    logger.debug('===================================================')
-    for epoch in range(1, EPOCH+1):
+    # for epoch in range(1, EPOCH+1):
+    epoch = 0
+    while True:
+        epoch += 1
 
         logger.debug('Start learning phase of {} epoch'.format(epoch))
 
-        i = 1
-
         train_dataset = zip(train_correct_lists, train_wrong_lists)
 
-        max_iter = len(train_dataset)/16
+        i = 1
+        max_iter = len(train_dataset)/BATCH_SIZE/2 # 1時間くらいで終わるように
         learning_progress = tqdm(total=max_iter)
 
-        for [(correct_id_list, wrong_id_list)] in chainer.iterators.SerialIterator(train_dataset, 1, False, True):
+        for id_list_batch in chainer.iterators.SerialIterator(train_dataset, BATCH_SIZE, False, True):
+
+            correct_id_list = [id_list[0] for id_list in id_list_batch]
+            wrong_id_list = [id_list[1] for id_list in id_list_batch]
+
+            xs = make_batch(wrong_id_list, True)
+            ts = make_batch(correct_id_list, True)
 
             model.initialize()
 
-            context = model.encode(wrong_id_list, train=True)
+            state = model.encode(xs)
 
             sum_loss = 0
             sum_accuracy = 0
-            N = len(correct_id_list)
+            N = len(ts) - 1
+
+            context = model.connecter(F.dropout(state,
+                                     ratio=DROPOUT_RATIO, train=True))
+            model.decoder.h = context
 
             # バッチ学習の場合には行を複数にしてsum_lossを計算した後にパラメータを更新する
-            for correct_id in correct_id_list:
-                loss, accuracy, context = model.decode(context, correct_id, train=True)
+            for correct_id, next_correct_id in zip(ts[:-1], ts[1:]):
+                loss, accuracy, context = model.decode(correct_id, next_correct_id)
                 sum_loss += loss
                 sum_accuracy += accuracy
+
+            sum_loss /= N
+            sum_accuracy /= N
 
             model.cleargrads()  # 前の学習結果のgradが残っているので初期化する
             sum_loss.backward()  # model内でgradを計算, 設定
             sum_loss.unchain_backward()  # これ必要なの？
-            sum_accuracy.backward()  # model内でgradを計算, 設定
-            sum_accuracy.unchain_backward()  # これ必要なの？
             optimizer.update()  # 上で計算したgradを元にSGDを実行
 
-            loss_data = float(cuda.to_cpu(sum_loss.data))/N
+            loss_data = float(cuda.to_cpu(sum_loss.data))
             perp = math.exp(loss_data)
-            acc_data = float(cuda.to_cpu(sum_accuracy.data))/N
+            acc_data = float(cuda.to_cpu(sum_accuracy.data))
 
-            learning_progress.set_description("[training] epoch={} iter={} perplexity={} accuracy={}".format(
+            learning_progress.set_description("[training] epoch={:<2} iter={:<6} perplexity={:<5.5} accuracy={:<5.5}".format(
                             epoch, i, perp, acc_data
                         ))
 
@@ -285,50 +377,66 @@ def main(args):
                 break
 
         learning_progress.close()
+
         logger.debug('Start evaluation phase of {} epoch'.format(epoch))
 
-        N = len(zip(test_correct_lists, test_wrong_lists))
+        N = len(test_correct_lists)
+        max_iter = N/BATCH_SIZE
+
         evaluate_progress = ProgressBar(widgets=[Bar('=', '[', ']'), ' ', Percentage(), ' ', ETA()],
-                                        maxval=N).start()
+                                         maxval=max_iter).start()
         j = 0
         loss = 0.0
         accuracy = 0.0
-        num_of_trials = 0
-
-        end_token_id = w2i["NEWLINE"]
 
         test_dataset = zip(test_correct_lists, test_wrong_lists)
 
-        for [(correct_id_list, wrong_id_list)] in chainer.iterators.SerialIterator(test_dataset, 1, False, True):
-            # correct_token_list = w2i.generate_token_list_by(correct_id_list)
-            # wrong_token_list = w2i.generate_token_list_by(wrong_id_list)
+        for id_list_batch in chainer.iterators.SerialIterator(test_dataset, BATCH_SIZE, False, True):
+            correct_id_list = [id_list[0] for id_list in id_list_batch]
+            wrong_id_list = [id_list[1] for id_list in id_list_batch]
 
-            # predicted_token_list = model.generate(w2i, wrong_id_list, end_token_id)
+            xs = make_batch(wrong_id_list, True)
+            ts = make_batch(correct_id_list, True)
 
-            # logger.debug('INPUT (wrong tokens)')
-            # logger.debug(" ".join(wrong_token_list))
-            # logger.debug('OUTPUT (predicted_tokens)')
-            # logger.debug(" ".join(predicted_token_list))
-            # logger.debug('EXPECTED (correct tokens)')
-            # logger.debug(" ".join(correct_token_list))
-
-            loss, accuracy, n = model.evaluate(wrong_id_list, end_token_id, correct_id_list)
+            loss, accuracy = model.evaluate(w2i, xs, ts)
 
             loss += loss
             accuracy += accuracy
-            num_of_trials += n
 
             evaluate_progress.update(j+1)
             j = j + 1
 
-        accuracy = float(cuda.to_cpu(accuracy))/num_of_trials
-        loss = float(cuda.to_cpu(loss))/num_of_trials
+            if max_iter == j:
+                break
 
-        logger.debug("accuracy: {}, loss: {}".format(accuracy.data, loss.data))
+        accuracy = float(cuda.to_cpu(accuracy.data))/j
+        loss = float(cuda.to_cpu(loss.data))/j
 
-    logger.debug('Save result of learning')
-    serializers.save_hdf5(MODEL_PATH, model)
-    serializers.save_hdf5(OPT_PATH, optimizer)
+        logger.debug("accuracy: {}, loss: {}".format(accuracy, loss))
+
+	logger.debug('Save result of learning')
+	serializers.save_hdf5(MODEL_PATH.format(epoch), model)
+	serializers.save_hdf5(OPT_PATH.format(epoch), optimizer)
+
+        logger.debug("Try to generate predict code from random wrong code")
+
+        index = random.randint(len(test_dataset))
+        correct_id_list, wrong_id_list = test_dataset[index]
+
+        correct_token_list = w2i.generate_token_list_by(correct_id_list)
+        wrong_token_list = w2i.generate_token_list_by(wrong_id_list)
+
+        predicted_token_list = model.generate(w2i, wrong_id_list)
+
+        logger.debug('INPUT (wrong tokens)')
+        logger.debug(" ".join(wrong_token_list))
+        logger.debug('OUTPUT (predicted_tokens)')
+        logger.debug(" ".join(predicted_token_list))
+        logger.debug('EXPECTED (correct tokens)')
+        logger.debug(" ".join(correct_token_list))
+
+        if accuracy > 0.7:
+            break
 
 
 if __name__ == "__main__":

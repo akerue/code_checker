@@ -40,8 +40,8 @@ class Simplexer:
                 'TAB',
                 'STRING',
                 'NEWLINE',
-                'NUMBER',
-                'ID',
+                # 'NUMBER',
+                # 'ID',
         )
 
         t_TAB          = r'\t'

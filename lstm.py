@@ -1,25 +1,39 @@
 # _*_coding:utf-8_*_
 
+from log_tool import generate_logger
+
+logger = generate_logger(__file__)
+
 from word2id import Word2Id
 
-from chainer import datasets, iterators, optimizers, serializers
-from chainer import Link, Chain, ChainList
+import chainer
+from chainer import optimizers, serializers, cuda
+from chainer import Chain, Variable
 import chainer.functions as F
 import chainer.links as L
-from chainer.training import extensions
 
-import math
-import six
 import numpy as np
+from numpy import * 
 import argparse
 from decimal import *
+import os.path
+import math
+import dill
+import cPickle as pickle
 
-VOCAB_SIZE = 10000
-HIDDEN_SIZE = 100
-batchsize = 100
+from tqdm import tqdm
+
+xp = np
+
+VOCAB_SIZE = 100
+HIDDEN_SIZE = 50
+batchsize = 256 
 
 getcontext().prec = 7
 
+CACHE_PATH = "./cache/word2id_dict.pkl"
+MODEL_PATH = "./serialize/seq2seq_epoch{}.model"
+OPT_PATH = "./serialize/seq2seq_epoch{}.opt"
 
 def getArgs():
     """
@@ -28,10 +42,26 @@ def getArgs():
     parser = argparse.ArgumentParser(description="")
 
     parser.add_argument(
-        "-f", "--input",
-        dest="input_file",
+        "-c", "--correct",
+        dest="correct_corpus",
         type=argparse.FileType("r"),
-        help="input filename"
+        help="correct corpus file",
+        required=True,
+    )
+
+    parser.add_argument(
+        "-w", "--wrong",
+        dest="wrong_corpus",
+        type=argparse.FileType("r"),
+        help="wrong corpus file",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--gpu",
+        dest="gpu",
+        type=int,
+        default=0,
     )
 
     return parser.parse_args()
@@ -45,7 +75,7 @@ class LSTM(Chain):
             out=L.Linear(HIDDEN_SIZE, VOCAB_SIZE),  # the feed-forward output layer
         )
 
-    def reset_state(self):
+    def initialize(self):
         self.mid.reset_state()
 
     def __call__(self, cur_word):
@@ -56,12 +86,6 @@ class LSTM(Chain):
         return y
 
 
-def create_one_hot_vector(word_id):
-    word_vec = np.zeros(VOCAB_SIZE, dtype=np.int32)
-    word_vec[word_id] = 1
-    return word_vec
-
-
 def compute_loss(x_list):
     # 損失関数
     loss = 0
@@ -69,54 +93,62 @@ def compute_loss(x_list):
     # perm = np.random.permutation(len(train_id_lists)-batchsize-1)
 
     for i in six.moves.range(len(x_list)-1):
-        cur_word_vec = np.array([x_list[i]])
-        next_word_vec = np.array([x_list[i+1]])
+        cur_word_vec = xp.array([x_list[i]])
+        next_word_vec = xp.array([x_list[i+1]])
         loss += model(cur_word_vec, next_word_vec)
     print("loss:{}".format(loss.data))
     return loss
 
 
-if __name__ == "__main__":
+def main():
+    global xp
     args = getArgs()
 
-    tokens_list = args.input_file.readlines()
+    tokens_list = args.correct_corpus.readlines()
 
-    lstm = LSTM()
-    model = L.Classifier(lstm)
+    model = LSTM()
+
+    if args.gpu >= 0:
+        cuda.get_device(args.gpu).use()
+        model.to_gpu(args.gpu)
+	import cupy
+	xp = cupy
+
     optimizer = optimizers.SGD()
     optimizer.setup(model)
-
-    lstm.reset_state()
 
     w2i = Word2Id()
 
     id_lists = []
 
+    pbar = tqdm(total=len(tokens_list))
+    logger.debug("Convert token corpus to id corpus")
+
     for tokens in tokens_list:
-        id_lists.append(np.array(w2i.convert_id_list(tokens), dtype=np.int32))
+        id_lists.append(xp.array(w2i.convert_id_list(tokens), dtype=xp.int32))
+        pbar.update(1)
+    pbar.close()
 
     num_of_sample = len(id_lists)
 
     train_id_lists = id_lists[:num_of_sample*9/10]
     test_id_lists = id_lists[num_of_sample*9/10+1:]
 
-    # 学習フェーズ
-    epoch = 0
-    for id_list in train_id_lists:
-        optimizer.update(compute_loss, id_list)
-        epoch += 1
-        if epoch == 10:
-            break
+    for epoch in range(1, EPOCH+1):
+        logger.debug('Start learning phase of {} epoch'.format(epoch))
+
+        for id_list in train_id_lists:
+            optimizer.update(compute_loss, id_list)
 
     def evaluation(x_list):
         total = 0
         hit = 0
         for i in xrange(len(x_list) - 1):
-            cur_word_vec = np.array([x_list[i]])
+            cur_word_vec = xp.array([x_list[i]])
             result = lstm(cur_word_vec).data
             print(result)
             print(result.shape)
-            result = np.argmax(result)
+            result = xp.argmax(result)
             print(w2i.search_word_by(x_list[i+1]), w2i.search_word_by(result))
             total += 1
             # print("Answer:{} -> Predict:{}".format(x_list[i+1], result))
@@ -129,3 +161,10 @@ if __name__ == "__main__":
     # 評価フェーズ
     for id_list in test_id_lists:
         evaluation(id_list)
+
+
+if __name__ == "__main__":
+    try:
+        main(getArgs())
+    except Exception as e:
+        logger.exception(e.args)
